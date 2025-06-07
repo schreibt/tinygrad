@@ -4323,6 +4323,83 @@ class Tensor(MathTrait):
     ret = ret.reshape(bs, oy, ox, cout).permute(0,3,1,2)
     return ret if bias is None else ret.add(bias.reshape(1, -1, 1, 1))
 
+  def associative_scan(self, op: Callable[[Tensor, Tensor], Tensor], axis: int = 0, reverse: bool = False) -> Tensor:
+    """
+    Performs an associative scan operation along the specified axis.
+    
+    Args:
+        op: An associative binary operation (e.g., add, mul, max)
+        axis: The axis to scan along
+        reverse: If True, scan in reverse direction
+        
+    Returns:
+        Tensor: The result of the scan operation
+    """
+    if axis < 0:
+        axis = len(self.shape) + axis
+    if axis >= len(self.shape):
+        raise ValueError(f"axis {axis} out of bounds for tensor of dimension {len(self.shape)}")
+    
+    # Handle reverse scan by flipping the input and output
+    if reverse:
+        return self.flip(axis).associative_scan(op, axis).flip(axis)
+    
+    # For small tensors, use the existing _cumalu implementation
+    if self.shape[axis] <= 32:
+        return self._cumalu(op, axis)
+    
+    # For larger tensors, use the split approach
+    return self._split_cumalu(op, axis)
+
+  def _cumalu(self, op: Callable[[Tensor, Tensor], Tensor], axis: int) -> Tensor:
+    """Internal method for cumulative operations using padding and pooling."""
+    # Pad the input tensor to a power of 2
+    pad_size = 2**math.ceil(math.log2(self.shape[axis])) - self.shape[axis]
+    if pad_size > 0:
+        pad_shape = list(self.shape)
+        pad_shape[axis] = pad_size
+        padded = self.cat(Tensor.zeros(*pad_shape, device=self.device), dim=axis)
+    else:
+        padded = self
+    
+    # Perform the scan operation
+    result = padded
+    size = result.shape[axis]
+    while size > 1:
+        size = size // 2
+        # Create shifted version of the tensor
+        shifted = result.roll(-size, axis)
+        # Apply the operation
+        result = op(result, shifted)
+    
+    # Remove padding if it was added
+    if pad_size > 0:
+        result = result.slice(axis, 0, self.shape[axis])
+    
+    return result
+
+  def _split_cumalu(self, op: Callable[[Tensor, Tensor], Tensor], axis: int) -> Tensor:
+    """Internal method for handling larger tensors by splitting into segments."""
+    # Split the tensor into segments of size 32
+    segment_size = 32
+    segments = []
+    for i in range(0, self.shape[axis], segment_size):
+        end = min(i + segment_size, self.shape[axis])
+        segment = self.slice(axis, i, end)
+        segments.append(segment._cumalu(op, axis))
+    
+    # Combine segments
+    result = segments[0]
+    for segment in segments[1:]:
+        # Get the last element of the current result
+        last = result.slice(axis, -1, None)
+        # Apply the operation to the last element and the next segment
+        segment = op(last, segment)
+        # Concatenate the results
+        result = result.cat(segment, dim=axis)
+    
+    return result
+
 P = ParamSpec("P")
 T = TypeVar("T")
 def _metadata_wrapper(fn: Callable[P, T]) -> Callable[P, T]:
